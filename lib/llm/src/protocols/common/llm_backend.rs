@@ -128,6 +128,7 @@ pub struct TopLogprob {
 }
 pub type TopLogprobs = Vec<Vec<TopLogprob>>; // num_tokens x top_logprobs
 
+/// Rarely-set fields are boxed for the same reason as in [`LLMEngineOutput`].
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct BackendOutput {
     /// New token_ids generated from the LLM Engine
@@ -187,7 +188,7 @@ pub struct BackendOutput {
     /// can record an OTel `Link` on its `engine.generate` span. Engines
     /// should NOT read or write this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worker_trace_link: Option<crate::protocols::common::preprocessor::TraceLink>,
+    pub worker_trace_link: Option<Box<crate::protocols::common::preprocessor::TraceLink>>,
 
     /// Opaque engine data passed through from the backend worker to the response.
     /// Dynamo does not inspect this field; it is serialized as-is into `nvext.engine_data`.
@@ -198,13 +199,13 @@ pub struct BackendOutput {
     /// a standalone router) so it joins this request's trace/metrics. Dynamo-internal,
     /// consumed by the frontend and not surfaced to clients. See [`RoutingData`](crate::protocols::common::timing::RoutingData).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub routing_data: Option<crate::protocols::common::timing::RoutingData>,
+    pub routing_data: Option<Box<crate::protocols::common::timing::RoutingData>>,
 
     /// Frontend-only decoder checkpoint for a possible migration retry. Its serialized
     /// representation remains the historical optional `jailed_text` string; pending token
     /// IDs are in-memory-only and let the retry reconstruct incremental decoding state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub jailed_text: Option<DecoderCheckpoint>,
+    pub jailed_text: Option<Box<DecoderCheckpoint>>,
 }
 
 /// The LLM engine and backnd with manage it's own state, specifically translating how a
@@ -215,6 +216,10 @@ pub struct BackendOutput {
 ///
 /// This is the minimal raw output from the LLM engine. The Backend may then apply multiple
 /// levels of post-processing before the BackendOutput is returns
+///
+/// Rarely-set fields are boxed: every token's output moves by value through each stream
+/// layer, so their inline size would be copied each time. `Box` is transparent to serde, so
+/// the wire format is unchanged.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 pub struct LLMEngineOutput {
     // new token_ids
@@ -235,7 +240,7 @@ pub struct LLMEngineOutput {
 
     /// Multimodal content parts (for non-text outputs)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_parts: Option<Vec<ContentPart>>,
+    pub content_parts: Option<Box<Vec<ContentPart>>>,
 
     /// cumulative log probabilities
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -279,11 +284,11 @@ pub struct LLMEngineOutput {
     /// prefill terminal chunk; consumed by the decode adapter. Engines
     /// should NOT read or write this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worker_trace_link: Option<crate::protocols::common::preprocessor::TraceLink>,
+    pub worker_trace_link: Option<Box<crate::protocols::common::preprocessor::TraceLink>>,
 
     /// Additional arguments for extensibility
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub extra_args: Option<serde_json::Value>,
+    pub extra_args: Option<Box<serde_json::Value>>,
 
     // Token usage information
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -297,13 +302,13 @@ pub struct LLMEngineOutput {
     /// Router-computed data handed back to the frontend (e.g. standalone-router timing).
     /// Dynamo-internal; consumed by the frontend. See [`RoutingData`](crate::protocols::common::timing::RoutingData).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub routing_data: Option<crate::protocols::common::timing::RoutingData>,
+    pub routing_data: Option<Box<crate::protocols::common::timing::RoutingData>>,
 
     /// Frontend-only decoder checkpoint for a possible migration retry. Engines never set
     /// it; `Backend` populates it after worker deserialization. The legacy optional-string
     /// wire shape is retained, while pending token IDs are kept in memory only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub jailed_text: Option<DecoderCheckpoint>,
+    pub jailed_text: Option<Box<DecoderCheckpoint>>,
 }
 
 impl LLMEngineOutput {
@@ -515,7 +520,7 @@ mod tests {
             worker_trace_link: None,
             engine_data: None,
             routing_data: None,
-            jailed_text: checkpoint,
+            jailed_text: checkpoint.map(Box::new),
         }
     }
 
@@ -540,7 +545,7 @@ mod tests {
         );
         let decoded_legacy: BackendOutput = serde_json::from_value(legacy).unwrap();
         let checkpoint = decoded_legacy.jailed_text.unwrap();
-        assert_eq!(&*checkpoint, "ST");
+        assert_eq!(&**checkpoint, "ST");
         assert!(checkpoint.into_parts().1.is_empty());
 
         let populated = serde_json::to_value(checkpoint_output(Some(DecoderCheckpoint::new(

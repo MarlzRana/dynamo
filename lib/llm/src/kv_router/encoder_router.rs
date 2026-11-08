@@ -369,7 +369,7 @@ impl EncoderRouter {
             .encoder_result
             .filter(serde_json::Value::is_object)
             .context("Encode worker terminal is missing an object-shaped encoder_result")?;
-        Ok((result, terminal.worker_trace_link))
+        Ok((result, terminal.worker_trace_link.map(|link| *link)))
     }
 }
 

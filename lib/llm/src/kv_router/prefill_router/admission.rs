@@ -156,7 +156,7 @@ impl PrefillRouter {
                 disaggregated_params,
                 prompt_tokens_details,
             },
-            worker_link: output.worker_trace_link.clone(),
+            worker_link: output.worker_trace_link.as_deref().cloned(),
             completion,
         })
     }

@@ -957,10 +957,10 @@ mod tests {
             assert!(request.get_annotation_value("query_instance_id").is_some());
             self.requests.fetch_add(1, Ordering::Relaxed);
             let output = Annotated::from_data(LLMEngineOutput {
-                routing_data: Some(RoutingData {
+                routing_data: Some(Box::new(RoutingData {
                     token_ids: Some(request.token_ids.as_ref().clone()),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             });
             Ok(ResponseStream::new(

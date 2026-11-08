@@ -57,10 +57,10 @@ impl HasTokenIds for BackendOutput {
         &self.token_ids
     }
     fn worker_trace_link(&self) -> Option<&crate::protocols::common::preprocessor::TraceLink> {
-        self.worker_trace_link.as_ref()
+        self.worker_trace_link.as_deref()
     }
     fn decoder_checkpoint(&self) -> Option<&DecoderCheckpoint> {
-        self.jailed_text.as_ref()
+        self.jailed_text.as_deref()
     }
     fn completion_usage_mut(&mut self) -> Option<&mut CompletionUsage> {
         self.completion_usage.as_mut()
@@ -72,10 +72,10 @@ impl HasTokenIds for LLMEngineOutput {
         &self.token_ids
     }
     fn worker_trace_link(&self) -> Option<&crate::protocols::common::preprocessor::TraceLink> {
-        self.worker_trace_link.as_ref()
+        self.worker_trace_link.as_deref()
     }
     fn decoder_checkpoint(&self) -> Option<&DecoderCheckpoint> {
-        self.jailed_text.as_ref()
+        self.jailed_text.as_deref()
     }
     fn completion_usage_mut(&mut self) -> Option<&mut CompletionUsage> {
         self.completion_usage.as_mut()
@@ -3090,7 +3090,7 @@ mod tests {
                     );
                     let responses = stream::iter(vec![
                         Annotated::from_data(BackendOutput {
-                            jailed_text: Some("STOP".to_string().into()),
+                            jailed_text: Some(Box::new("STOP".to_string().into())),
                             ..create_mock_output(10).data.unwrap()
                         }),
                         Annotated::from_err(
@@ -3475,7 +3475,7 @@ mod tests {
                         if i == start
                             && let (Some(link), Some(data)) = (&link, out.data.as_mut())
                         {
-                            data.worker_trace_link = Some(link.clone());
+                            data.worker_trace_link = Some(Box::new(link.clone()));
                         }
                         if tx.send(out).await.is_err() {
                             return;
