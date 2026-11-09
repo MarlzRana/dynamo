@@ -4,7 +4,10 @@
 use std::{borrow::Cow, fmt::Display, sync::LazyLock};
 
 use dynamo_protocols::types::{
-    ChatCompletionTool, ChatCompletionToolType, CreateChatCompletionRequest, FunctionObject,
+    ChatCompletionRequestMessage, ChatCompletionRequestToolMessageContent,
+    ChatCompletionRequestToolMessageContentPart, ChatCompletionRequestUserMessageContent,
+    ChatCompletionRequestUserMessageContentPart, ChatCompletionTool, ChatCompletionToolType,
+    CreateChatCompletionRequest, FunctionObject,
 };
 use dynamo_protocols::validation;
 
@@ -480,6 +483,22 @@ pub fn validate_messages(
     // as a JSON object string; reject bad non-empty shapes before chat-template rendering.
     // This was caught in MiniMax-M3 multi-turn tool-call tests
     for (message_index, message) in messages.iter().enumerate() {
+        let has_custom_content = match message {
+            ChatCompletionRequestMessage::User(user) => {
+                matches!(&user.content, ChatCompletionRequestUserMessageContent::Array(parts)
+                    if parts.iter().any(|part| matches!(part, ChatCompletionRequestUserMessageContentPart::Custom(_))))
+            }
+            ChatCompletionRequestMessage::Tool(tool) => {
+                matches!(&tool.content, ChatCompletionRequestToolMessageContent::Array(parts)
+                    if parts.iter().any(|part| matches!(part, ChatCompletionRequestToolMessageContentPart::Custom(_))))
+            }
+            _ => false,
+        };
+        if has_custom_content {
+            anyhow::bail!(
+                "`messages[{message_index}].content` custom modality parts are not supported"
+            );
+        }
         if let dynamo_protocols::types::ChatCompletionRequestMessage::Assistant(assistant) = message
             && let Some(tool_calls) = &assistant.tool_calls
         {
@@ -1001,6 +1020,24 @@ mod tests {
     use super::*;
     use crate::engines::ValidateRequest;
     use crate::protocols::openai::completions::NvCreateCompletionRequest;
+
+    #[test]
+    fn custom_content_parts_remain_unsupported() {
+        for role in ["user", "tool"] {
+            let message: ChatCompletionRequestMessage = serde_json::from_value(json!({
+                "role": role,
+                "tool_call_id": "call_1",
+                "content": [{"type": "custom", "kind": "example", "fields": {}}]
+            }))
+            .unwrap();
+            assert!(
+                validate_messages(&[message])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("custom modality parts are not supported")
+            );
+        }
+    }
 
     /// Echoing client-controlled keys can duplicate a whole request body while
     /// building HTTP errors, so oversized keys must also yield a fixed diagnostic.
