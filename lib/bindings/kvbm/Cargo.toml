@@ -64,8 +64,8 @@ cudarc = { version = "=0.19.8", features = ["cuda-version-from-build-system", "f
 # Separate Cargo workspace: the frontend crates arrive through dynamo-llm and
 # must resolve to the same sources as the root workspace's [patch.crates-io].
 [patch.crates-io]
-dynamo-parsers = { git = "https://github.com/ai-dynamo/frontend-crates.git", rev = "db4dde34106f942e2d7d172e3e59027051568cd6" }
-dynamo-parsers-v2 = { git = "https://github.com/ai-dynamo/frontend-crates.git", rev = "db4dde34106f942e2d7d172e3e59027051568cd6" }
-dynamo-protocols = { git = "https://github.com/ai-dynamo/frontend-crates.git", rev = "db4dde34106f942e2d7d172e3e59027051568cd6" }
-dynamo-renderer = { git = "https://github.com/ai-dynamo/frontend-crates.git", rev = "db4dde34106f942e2d7d172e3e59027051568cd6" }
-dynamo-tokenizers = { git = "https://github.com/ai-dynamo/frontend-crates.git", rev = "db4dde34106f942e2d7d172e3e59027051568cd6" }
+dynamo-parsers = { git = "https://github.com/ai-dynamo/frontend-crates.git", rev = "bcb12adfd7924c03a6a11333a47caa7dc9014aa6" }
+dynamo-parsers-v2 = { git = "https://github.com/ai-dynamo/frontend-crates.git", rev = "bcb12adfd7924c03a6a11333a47caa7dc9014aa6" }
+dynamo-protocols = { git = "https://github.com/ai-dynamo/frontend-crates.git", rev = "bcb12adfd7924c03a6a11333a47caa7dc9014aa6" }
+dynamo-renderer = { git = "https://github.com/ai-dynamo/frontend-crates.git", rev = "bcb12adfd7924c03a6a11333a47caa7dc9014aa6" }
+dynamo-tokenizers = { git = "https://github.com/ai-dynamo/frontend-crates.git", rev = "bcb12adfd7924c03a6a11333a47caa7dc9014aa6" }
