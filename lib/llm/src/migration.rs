@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use anyhow::{Error, Result};
 use futures::{stream, stream::StreamExt};
+use tracing::Instrument;
 
 use crate::{
     http::service::metrics::Metrics,
@@ -392,6 +393,9 @@ where
     /// Delivered tokens replayed in the active attempt's prompt. The worker counts them in its
     /// `prompt_tokens` although the client received them as completion.
     replayed_tokens: u32,
+    /// The span current when the request was dispatched. The response body polls this stream
+    /// without entering the request span, so a mid-stream retry runs in this one.
+    span: tracing::Span,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -485,6 +489,7 @@ where
             pending_migration: None,
             prompt_len,
             replayed_tokens: 0,
+            span: tracing::Span::current(),
         };
         slf.new_stream(None).await?;
         slf.exceed_max_seq_len(0); // disable migration if prompt len > max_seq_len
@@ -502,53 +507,10 @@ where
                 }
             };
             if let Some(mut response) = response_stream.next().await {
-                // Check if this is a migratable error that should trigger stream recreation.
                 if let Some(err) = response.error.as_ref() {
-                    if is_migratable_for_request(&self.request, err) {
-                        let Some(migration_error) = migratable_error_in_chain(err) else {
-                            tracing::warn!(error = %err, "Migration eligibility had no semantic error");
-                            continue;
-                        };
-                        if !self.attempts.has_remaining() {
-                            let route_trace = self.active_route_trace.clone();
-                            self.record_migration_exhausted(MigrationCause {
-                                reason: migration_error.error_type(),
-                                from_worker_id: route_trace
-                                    .as_deref()
-                                    .and_then(RouteTraceContext::selected_worker_id),
-                                attempt: self.failed_attempt(route_trace.as_deref()),
-                            });
-                            // The stream host parked the lifecycle on this
-                            // failure. The client receives this worker error
-                            // (below), so the classifier's abort cause must be
-                            // the same error, not the synthetic exhaustion
-                            // error `new_stream` would otherwise abort with.
-                            self.abort_request_lifecycle(err);
-                        } else {
-                            self.queue_migration(
-                                migration_error.error_type(),
-                                self.active_route_trace.clone(),
-                            );
-                        }
-                        tracing::warn!(error = %err, "Stream disconnected, recreating stream");
-                        self.metrics.inc_migration_ongoing_request(&self.model_name);
-                        let migration_event =
-                            MigrationEvent::new(frontend_service::migration_type::ONGOING_REQUEST);
-                        // NOTE: Delegate exhaustion to new_stream so retry accounting has one owner.
-                        // When no replacement is established, preserve the triggering stream error.
-                        if let Err(err) = self.new_stream(Some(migration_event)).await {
-                            tracing::warn!(error = ?err, "Cannot recreate stream");
-                        } else {
-                            self.release_replay_prompt_if_final();
-                            continue;
-                        }
-                    } else {
-                        // The stream host parks the classifier lifecycle on any
-                        // type-migratable failure, but an explicit worker pin can
-                        // veto the retry here. Nothing will claim the parked
-                        // lifecycle, so abort it with the cause now rather than
-                        // letting Drop emit a late, cause-less event.
-                        self.abort_request_lifecycle(err);
+                    let span = self.span.clone();
+                    if self.recover_from_stream_error(err).instrument(span).await {
+                        continue;
                     }
                 }
                 self.track_response(&response);
@@ -557,6 +519,57 @@ where
             }
             return None;
         }
+    }
+
+    /// Recreates the stream if `err` is a migratable error. Returns `true` when the error item
+    /// must not reach the client.
+    async fn recover_from_stream_error(&mut self, err: &DynamoError) -> bool {
+        if !is_migratable_for_request(&self.request, err) {
+            // The stream host parks the classifier lifecycle on any
+            // type-migratable failure, but an explicit worker pin can
+            // veto the retry here. Nothing will claim the parked
+            // lifecycle, so abort it with the cause now rather than
+            // letting Drop emit a late, cause-less event.
+            self.abort_request_lifecycle(err);
+            return false;
+        }
+        let Some(migration_error) = migratable_error_in_chain(err) else {
+            tracing::warn!(error = %err, "Migration eligibility had no semantic error");
+            return true;
+        };
+        if !self.attempts.has_remaining() {
+            let route_trace = self.active_route_trace.clone();
+            self.record_migration_exhausted(MigrationCause {
+                reason: migration_error.error_type(),
+                from_worker_id: route_trace
+                    .as_deref()
+                    .and_then(RouteTraceContext::selected_worker_id),
+                attempt: self.failed_attempt(route_trace.as_deref()),
+            });
+            // The stream host parked the lifecycle on this
+            // failure. The client receives this worker error
+            // (below), so the classifier's abort cause must be
+            // the same error, not the synthetic exhaustion
+            // error `new_stream` would otherwise abort with.
+            self.abort_request_lifecycle(err);
+        } else {
+            self.queue_migration(
+                migration_error.error_type(),
+                self.active_route_trace.clone(),
+            );
+        }
+        tracing::warn!(error = %err, "Stream disconnected, recreating stream");
+        self.metrics.inc_migration_ongoing_request(&self.model_name);
+        let migration_event =
+            MigrationEvent::new(frontend_service::migration_type::ONGOING_REQUEST);
+        // NOTE: Delegate exhaustion to new_stream so retry accounting has one owner.
+        // When no replacement is established, preserve the triggering stream error.
+        if let Err(err) = self.new_stream(Some(migration_event)).await {
+            tracing::warn!(error = ?err, "Cannot recreate stream");
+            return false;
+        }
+        self.release_replay_prompt_if_final();
+        true
     }
 
     /// Abort any classifier lifecycle parked for a retry this request will not
@@ -898,6 +911,7 @@ where
             let total_len = self.request.token_ids.len() as u32 + new_output_len;
             if total_len > max_seq_len {
                 tracing::warn!(
+                    parent: &self.span,
                     "Sequence length {} exceeds migration max_seq_len {}, \
                      disabling migration",
                     total_len,
@@ -3580,6 +3594,119 @@ mod tests {
         );
 
         assert_eq!(metrics.get_migration_ongoing_request_count(TEST_MODEL), 2);
+    }
+
+    /// The HTTP response body polls the migration stream without entering the request span.
+    /// A mid-stream retry, its events and its dispatch must still run in the span the request
+    /// was dispatched in.
+    #[test]
+    fn mid_stream_retry_runs_in_the_dispatch_span() {
+        use std::sync::Mutex;
+        use tracing_subscriber::layer::{Context as LayerContext, Layer, SubscriberExt};
+        use tracing_subscriber::registry::LookupSpan;
+
+        /// The span each event from `migration.rs` is emitted in.
+        struct EventSpans(Arc<Mutex<Vec<Option<&'static str>>>>);
+
+        impl<S> Layer<S> for EventSpans
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_event(&self, event: &tracing::Event<'_>, ctx: LayerContext<'_, S>) {
+                if event.metadata().module_path() == Some("dynamo_llm::migration") {
+                    let span = ctx.event_span(event).map(|span| span.name());
+                    self.0.lock().unwrap().push(span);
+                }
+            }
+        }
+
+        /// Fails its first stream after one token; records the span each dispatch runs in.
+        struct FailOnceEngine {
+            context_id: String,
+            dispatch_spans: Mutex<Vec<Option<&'static str>>>,
+        }
+
+        #[async_trait]
+        impl
+            AsyncEngine<
+                SingleIn<PreprocessedRequest>,
+                ManyOut<Annotated<BackendOutput>>,
+                anyhow::Error,
+            > for FailOnceEngine
+        {
+            async fn generate(
+                &self,
+                _request: SingleIn<PreprocessedRequest>,
+            ) -> Result<ManyOut<Annotated<BackendOutput>>> {
+                let mut dispatch_spans = self.dispatch_spans.lock().unwrap();
+                dispatch_spans.push(tracing::Span::current().metadata().map(|m| m.name()));
+                let first = dispatch_spans.len() == 1;
+                let responses = async_stream::stream! {
+                    yield create_mock_output(101);
+                    if first {
+                        yield Annotated::from_err(
+                            DynamoError::builder()
+                                .error_type(ErrorType::Disconnected)
+                                .message("worker disconnected")
+                                .build(),
+                        );
+                    }
+                };
+                Ok(ResponseStream::new(
+                    Box::pin(responses),
+                    Arc::new(Controller::new(self.context_id.clone())),
+                ))
+            }
+        }
+
+        let event_spans = Arc::new(Mutex::new(Vec::new()));
+        let _interest_guard = crate::test_utils::tracing_interest_guard();
+        let subscriber = tracing_subscriber::registry().with(EventSpans(event_spans.clone()));
+        let context_id = uuid::Uuid::new_v4().to_string();
+        let engine = Arc::new(FailOnceEngine {
+            context_id: context_id.clone(),
+            dispatch_spans: Mutex::new(Vec::new()),
+        });
+        let next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
+            engine.clone();
+
+        let responses = tracing::subscriber::with_default(subscriber, || {
+            futures::executor::block_on(async {
+                let mut manager = RetryManager::build(
+                    Arc::new(Controller::new(context_id)),
+                    BTreeMap::new(),
+                    create_mock_request(10),
+                    next_generate,
+                    1,
+                    None,
+                    Arc::new(TEST_MODEL.to_string()),
+                    Arc::new(Metrics::new()),
+                    None,
+                )
+                .instrument(tracing::info_span!("http-request"))
+                .await
+                .unwrap();
+                event_spans.lock().unwrap().clear();
+                let mut responses = Vec::new();
+                while let Some(response) = manager.next().await {
+                    responses.push(response);
+                }
+                responses
+            })
+        });
+
+        assert_eq!(responses.len(), 2);
+        assert!(responses.iter().all(|response| response.error.is_none()));
+        assert_eq!(
+            *engine.dispatch_spans.lock().unwrap(),
+            [Some("http-request"), Some("http-request")]
+        );
+        let event_spans = event_spans.lock().unwrap();
+        assert!(!event_spans.is_empty());
+        assert!(
+            event_spans.iter().all(|span| *span == Some("http-request")),
+            "{event_spans:?}"
+        );
     }
 
     /// The `migration retries exhausted` event must name the attempt that
